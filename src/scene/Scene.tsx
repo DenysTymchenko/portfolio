@@ -1,15 +1,15 @@
 import { Physics } from '@react-three/rapier'
-import { Laptop } from './desk/Laptop'
+import { Laptop } from './Laptop'
 import { Diorama } from './Diorama'
 import { Effects } from './Effects'
 import { FollowCamera } from './FollowCamera'
-import { Garden } from './garden/Garden'
+import { Garden } from './Garden'
 import { Lights } from './Lights'
-import { Panda } from './panda/Panda'
-import { Room } from './room/Room'
-import { Sky } from './sky/Sky'
-import { VinylCorner } from './vinyl/VinylCorner'
-import { Zones } from './zones/Zones'
+import { Panda } from './Panda'
+import { Room } from './Room'
+import { Sky } from './Sky'
+import { VinylCorner } from './VinylCorner'
+import { Zones } from './Zones'
 
 /**
  * The whole world. The diorama model is the stage; the panda walks on it; the three points of
