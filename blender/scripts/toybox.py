@@ -1,15 +1,30 @@
-"""Tiny helpers for building chunky, bevelled "toy" props from code.
+"""Helpers for building everything from code in one consistent style: faceted low-poly toys.
 
-Every prop is a Shape: a bag of primitives (boxes, cylinders, spheres), each with its
-own material and bevel, merged into one mesh. Pivot sets the object's origin, which
-matters for parts that rotate (panda limbs, turntable platter).
+Style rules — keep every prop in this family so the scene reads as one world:
+- flat shading and matte colors everywhere, nothing smooth or glossy;
+- no sharp boxes: blocks get a single-segment chamfer sized to the block (`r` = fraction of the
+  smallest side, capped by `rmax`); round things are 6-12 sided; organic things (leaves, rocks,
+  cushions of foliage) are jittered low-res icospheres ("blobs");
+- chunky proportions and few parts, no fiddly realistic detail.
+
+Each prop is a Shape: a bag of primitives merged into one mesh. `pivot` sets the object's
+origin, which matters for parts that move (panda limbs, turntable platter, tree canopies).
 """
 
 import math
+import random
 
 import bmesh
 import bpy
 from mathutils import Euler, Matrix, Vector
+
+_rnd = random.Random(1)
+CHAMFER_ANGLE = math.radians(50)  # bevel only real corners, not the sides of 8+-gon cylinders
+
+
+def seed(n):
+    """Reset the jitter RNG so rebuilding gives the same shapes."""
+    _rnd.seed(n)
 
 
 def srgb(hex_color):
@@ -22,17 +37,18 @@ def srgb(hex_color):
     return (*out, 1.0)
 
 
-def material(name, hex_color, roughness=0.75, emission=None, strength=0.0):
+def material(name, hex_color, emission=None, strength=0.0):
+    """Matte material (roughness 1, no metal): the look is carried by flat colors and light."""
     mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     if not mat.node_tree:
         mat.use_nodes = True
     bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
     inputs = {s.identifier: s for s in bsdf.inputs}
     inputs["Base Color"].default_value = srgb(hex_color)
-    inputs["Roughness"].default_value = roughness
-    if emission:
-        inputs["Emission Color"].default_value = srgb(emission)
-        inputs["Emission Strength"].default_value = strength
+    inputs["Roughness"].default_value = 1.0
+    inputs["Metallic"].default_value = 0.0
+    inputs["Emission Color"].default_value = srgb(emission or "#000000")
+    inputs["Emission Strength"].default_value = strength if emission else 0.0
     mat.diffuse_color = srgb(hex_color)
     return mat
 
@@ -62,23 +78,25 @@ class Shape:
         self.bm = bmesh.new()
         self.mats = []
 
-    def _add(self, build, mat, bevel, segments, smooth):
+    def _add(self, build, mat, chamfer=0.0, jitter=0.0):
         tmp = bmesh.new()
         build(tmp)
-        if bevel > 0:
-            edges = [e for e in tmp.edges if e.calc_face_angle(0) > math.radians(40)]
+        if jitter:
+            center = sum((v.co for v in tmp.verts), Vector()) / len(tmp.verts)
+            for v in tmp.verts:
+                v.co = center + (v.co - center) * (1 + _rnd.uniform(-jitter, jitter))
+        if chamfer > 0:
+            edges = [e for e in tmp.edges if e.calc_face_angle(0) > CHAMFER_ANGLE]
             if edges:
-                bmesh.ops.bevel(tmp, geom=edges, offset=bevel, offset_type="OFFSET",
-                                segments=segments, profile=0.5, affect="EDGES", clamp_overlap=True)
+                bmesh.ops.bevel(tmp, geom=edges, offset=chamfer, offset_type="OFFSET", segments=1,
+                                profile=0.5, affect="EDGES", clamp_overlap=True)
         # Assign after bevelling: new bevel faces otherwise default to material 0.
         if mat not in self.mats:
             self.mats.append(mat)
         index = self.mats.index(mat)
         for f in tmp.faces:
             f.material_index = index
-            f.smooth = smooth
-        for e in tmp.edges:
-            e.smooth = e.calc_face_angle(0) < math.radians(50)
+            f.smooth = False
         mesh = bpy.data.meshes.new("_toybox_tmp")
         tmp.to_mesh(mesh)
         tmp.free()
@@ -86,34 +104,41 @@ class Shape:
         bpy.data.meshes.remove(mesh)
         return self
 
-    def box(self, x0, x1, y0, y1, z0, z1, mat, bevel=0.02, segments=2, smooth=True):
-        """Axis-aligned box from min/max bounds."""
+    def box(self, x0, x1, y0, y1, z0, z1, mat, r=0.25, rmax=0.12):
+        """Chamfered block from min/max bounds."""
         size = (x1 - x0, y1 - y0, z1 - z0)
         center = ((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2)
-        return self.boxc(center, size, mat, bevel=bevel, segments=segments, smooth=smooth)
+        return self.boxc(center, size, mat, r=r, rmax=rmax)
 
-    def boxc(self, center, size, mat, rot=None, bevel=0.02, segments=2, smooth=True):
-        """Box from center + size, optionally rotated (Euler radians)."""
+    def boxc(self, center, size, mat, rot=None, r=0.25, rmax=0.12):
+        """Chamfered block from center + size, optionally rotated (Euler radians)."""
         m = Matrix.Translation(center) @ _rotation(rot) @ Matrix.Diagonal((*size, 1))
-        bevel = min(bevel, 0.45 * min(size))
         return self._add(lambda bm: bmesh.ops.create_cube(bm, size=1.0, matrix=m),
-                         mat, bevel, segments, smooth)
+                         mat, chamfer=min(r * min(size), rmax))
 
-    def cyl(self, center, radius, depth, mat, rot=None, axis=None, radius2=None, verts=24,
-            scale=(1, 1, 1), bevel=0.015, segments=2, smooth=True):
-        """Cylinder (or cone with radius2) along local Z, centered on `center`."""
+    def frustum(self, center, w, d, h, mat, top=0.75, rot=None, r=0.2, rmax=0.08):
+        """Block whose top is scaled by `top` (tapered legs, pots, posts, roofs)."""
+        m = (Matrix.Translation(center) @ _rotation(rot) @ Matrix.Diagonal((w, d, h, 1))
+             @ Matrix.Rotation(math.pi / 4, 4, "Z"))
+        half_diag = math.sqrt(0.5)
+        return self._add(lambda bm: bmesh.ops.create_cone(
+            bm, cap_ends=True, cap_tris=False, segments=4, radius1=half_diag, radius2=half_diag * top,
+            depth=1.0, matrix=m), mat, chamfer=min(r * min(w, d, h), rmax))
+
+    def cyl(self, center, radius, depth, mat, rot=None, axis=None, radius2=None, verts=8,
+            scale=(1, 1, 1), r=0.25, rmax=0.06, jitter=0.0):
+        """Low-sided cylinder (or cone with radius2) along local Z, centered on `center`."""
         m = Matrix.Translation(center) @ _rotation(rot, axis) @ Matrix.Diagonal((*scale, 1))
         r2 = radius if radius2 is None else radius2
-        bevel = min(bevel, 0.45 * depth, 0.45 * max(radius, r2))
         return self._add(lambda bm: bmesh.ops.create_cone(
             bm, cap_ends=True, cap_tris=False, segments=verts, radius1=radius, radius2=r2,
-            depth=depth, matrix=m), mat, bevel, segments, smooth)
+            depth=depth, matrix=m), mat, chamfer=min(r * min(depth, max(radius, r2)), rmax), jitter=jitter)
 
-    def sphere(self, center, radius, mat, scale=(1, 1, 1), subdiv=2, smooth=False):
-        """Icosphere; flat-shaded by default for the faceted toy look."""
+    def blob(self, center, radius, mat, scale=(1, 1, 1), subdiv=1, jitter=0.12):
+        """Jittered low-res icosphere: foliage, rocks, clouds, round soft things."""
         m = Matrix.Translation(center) @ Matrix.Diagonal((*scale, 1))
         return self._add(lambda bm: bmesh.ops.create_icosphere(
-            bm, subdivisions=subdiv, radius=radius, matrix=m), mat, 0, 0, smooth)
+            bm, subdivisions=subdiv, radius=radius, matrix=m), mat, jitter=jitter)
 
     def build(self, name, collection, pivot=(0, 0, 0), parent=None):
         pivot = Vector(pivot)
@@ -133,7 +158,7 @@ class Shape:
 
 
 def empty(name, location, collection, rot=(0, 0, 0), size=0.15, parent=None):
-    """Named marker the web app looks up (spots, camera focus points, anchors)."""
+    """Named marker the web app looks up (spots, zones, anchors)."""
     obj = bpy.data.objects.new(name, None)
     obj.empty_display_type = "PLAIN_AXES"
     obj.empty_display_size = size
